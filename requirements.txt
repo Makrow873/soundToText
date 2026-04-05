@@ -2,3 +2,4 @@ flask
 flask-cors
 faster-whisper
 python-docx
+gunicorn
