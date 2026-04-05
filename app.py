@@ -102,6 +102,10 @@ def status(job_id):
     return jsonify(job)
 
 
+from docx import Document
+from docx.shared import Pt
+import datetime
+
 @app.route("/download/<job_id>")
 def download(job_id):
     job = jobs.get(job_id)
@@ -111,22 +115,41 @@ def download(job_id):
     text = job["text"]
     filename = Path(job.get("filename", "transkript")).stem
     detected_lang = job.get("language", "")
-
+    
     docx_path = UPLOAD_DIR / f"{job_id}.docx"
-    js_script = build_docx_script(text, filename, detected_lang, str(docx_path))
 
-    js_path = UPLOAD_DIR / f"{job_id}.js"
-    js_path.write_text(js_script, encoding="utf-8")
-
+    # Node.js yerine doğrudan Python ile Word oluşturma
     try:
-        result = subprocess.run(
-            ["node", str(js_path)],
-            capture_output=True, text=True, timeout=30
-        )
-        if result.returncode != 0:
-            return jsonify({"error": f"Word oluşturma hatası: {result.stderr}"}), 500
-    finally:
-        js_path.unlink(missing_ok=True)
+        doc = Document()
+        
+        # Başlık
+        baslik = doc.add_heading(f'Transkript: {filename}', 0)
+        baslik.style.font.name = 'Calibri'
+        
+        # Bilgi satırı
+        now = datetime.datetime.now().strftime("%d.%m.%Y %H:%M:%S")
+        bilgi_metni = f"Oluşturulma: {now}"
+        if detected_lang:
+            bilgi_metni += f"   •   Algılanan dil: {detected_lang.upper()}"
+        doc.add_paragraph(bilgi_metni)
+        
+        doc.add_paragraph("_" * 50) # Ayırıcı çizgi
+        
+        # Metni paragraflara bölerek ekle
+        paragraphs = [p.strip() for p in text.split("\n") if p.strip()]
+        if not paragraphs:
+            paragraphs = [text]
+            
+        for p_text in paragraphs:
+            p = doc.add_paragraph()
+            run = p.add_run(p_text)
+            run.font.name = 'Calibri'
+            run.font.size = Pt(12)
+            
+        doc.save(str(docx_path))
+        
+    except Exception as e:
+        return jsonify({"error": f"Word oluşturma hatası: {str(e)}"}), 500
 
     return send_file(
         str(docx_path),
