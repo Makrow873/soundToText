@@ -3,13 +3,12 @@ Ses → Metin → Word dönüştürücü
 Flask backend: Whisper ile transkripsiyon, docx-js ile Word çıktısı
 """
 
-from flask import Flask, request, jsonify, send_file, render_template_from_string
+from flask import Flask, request, jsonify, send_file
 from flask_cors import CORS
 import tempfile
 import os
 import subprocess
 import json
-import re
 from pathlib import Path
 import threading
 import uuid
@@ -20,10 +19,10 @@ CORS(app)
 UPLOAD_DIR = Path(tempfile.gettempdir()) / "ses_transkript"
 UPLOAD_DIR.mkdir(exist_ok=True)
 
-# İş durumlarını tut
 jobs = {}
 
-HTML_PAGE = open(Path(__file__).parent / "templates" / "index.html").read()
+with open(Path(__file__).parent / "templates" / "index.html", encoding="utf-8") as f:
+    HTML_PAGE = f.read()
 
 
 @app.route("/")
@@ -43,14 +42,14 @@ def transcribe():
     if file.filename == "":
         return jsonify({"error": "Dosya seçilmedi"}), 400
 
-    # Benzersiz iş ID'si
     job_id = str(uuid.uuid4())
     jobs[job_id] = {"status": "processing", "progress": "Dosya yükleniyor..."}
 
-    # Dosyayı kaydet
     suffix = Path(file.filename).suffix or ".mp3"
     audio_path = UPLOAD_DIR / f"{job_id}{suffix}"
     file.save(str(audio_path))
+
+    filename = file.filename
 
     def process():
         try:
@@ -71,13 +70,12 @@ def transcribe():
                 "status": "done",
                 "text": text,
                 "language": detected_lang,
-                "filename": file.filename,
+                "filename": filename,
             })
 
         except Exception as e:
             jobs[job_id] = {"status": "error", "error": str(e)}
         finally:
-            # Ses dosyasını temizle
             try:
                 audio_path.unlink()
             except Exception:
@@ -107,7 +105,6 @@ def download(job_id):
     filename = Path(job.get("filename", "transkript")).stem
     detected_lang = job.get("language", "")
 
-    # Node.js ile docx oluştur
     docx_path = UPLOAD_DIR / f"{job_id}.docx"
     js_script = build_docx_script(text, filename, detected_lang, str(docx_path))
 
@@ -133,8 +130,6 @@ def download(job_id):
 
 
 def build_docx_script(text: str, title: str, lang: str, output_path: str) -> str:
-    """Transkript Word belgesi oluşturan Node.js scripti üretir."""
-    # Metni paragraflara böl
     paragraphs = [p.strip() for p in text.split("\n") if p.strip()]
     if not paragraphs:
         paragraphs = [text]
@@ -155,7 +150,7 @@ def build_docx_script(text: str, title: str, lang: str, output_path: str) -> str
     paras_js = ",\n".join(para_lines)
 
     return f"""
-const {{ Document, Packer, Paragraph, TextRun, AlignmentType, HeadingLevel }} = require("docx");
+const {{ Document, Packer, Paragraph, TextRun, HeadingLevel }} = require("docx");
 const fs = require("fs");
 
 const title = {safe_title};
@@ -168,11 +163,7 @@ const doc = new Document({{
     default: {{ document: {{ run: {{ font: "Calibri", size: 24 }} }} }},
     paragraphStyles: [
       {{
-        id: "Heading1",
-        name: "Heading 1",
-        basedOn: "Normal",
-        next: "Normal",
-        quickFormat: true,
+        id: "Heading1", name: "Heading 1", basedOn: "Normal", next: "Normal", quickFormat: true,
         run: {{ size: 36, bold: true, font: "Calibri", color: "1A1A2E" }},
         paragraph: {{ spacing: {{ before: 0, after: 240 }}, outlineLevel: 0 }}
       }}
@@ -218,6 +209,7 @@ Packer.toBuffer(doc).then(buf => {{
 
 
 if __name__ == "__main__":
+    import os
     print("🎙️  Ses → Metin → Word Sunucusu başlatılıyor...")
     print("🌐  http://localhost:5000 adresini açın")
-    app.run(debug=False, host="0.0.0.0", port=5000)
+    app.run(debug=False, host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
