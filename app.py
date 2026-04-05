@@ -54,17 +54,24 @@ def transcribe():
     def process():
         try:
             jobs[job_id]["progress"] = "Whisper modeli yükleniyor..."
-            import whisper
-            model_obj = whisper.load_model(model)
+            # faster-whisper'ı içe aktar
+            from faster_whisper import WhisperModel
+            
+            # cpu ve int8 (sıkıştırılmış) formatında yükle - RAM tasarrufu için kritik!
+            model_obj = WhisperModel(model, device="cpu", compute_type="int8")
 
             jobs[job_id]["progress"] = "Transkripsiyon yapılıyor..."
+            
             opts = {}
             if language:
                 opts["language"] = language
 
-            result = model_obj.transcribe(str(audio_path), **opts)
-            text = result["text"].strip()
-            detected_lang = result.get("language", "?")
+            # Transkripsiyonu başlat
+            segments, info = model_obj.transcribe(str(audio_path), **opts)
+            
+            # Segmentleri birleştirip metne çevir
+            text = " ".join([segment.text for segment in segments]).strip()
+            detected_lang = info.language
 
             jobs[job_id].update({
                 "status": "done",
