@@ -89,7 +89,12 @@ def transcribe():
             print(f"[{job_id}] Transkripsiyon başlatıldı. Dil seçimi: {language or 'Otomatik'}")
             
             # Transkripsiyon işlemini başlat (segments bir jeneratördür)
-            segments, info = model_obj.transcribe(str(audio_path), **opts)
+            segments, info = model_obj.transcribe(
+                str(audio_path), 
+                vad_filter=True, 
+                condition_on_previous_text=False, 
+                **opts
+            )
             
             # Jeneratördeki tüm segmentleri tüketerek metni birleştiriyoruz
             text_segments = []
