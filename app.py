@@ -1,28 +1,38 @@
 """
-Ses → Metin → Word dönüştürücü
-Flask backend: Whisper ile transkripsiyon, docx-js ile Word çıktısı
+Ses → Metin → Word Dönüştürücü
+Flask Backend: faster-whisper ile transkripsiyon, python-docx ile Word çıktısı
 """
 
+import os
+import uuid
+import datetime
+import threading
+from pathlib import Path
+import tempfile
 from flask import Flask, request, jsonify, send_file
 from flask_cors import CORS
-import tempfile
-import os
-import subprocess
-import json
-from pathlib import Path
-import threading
-import uuid
+from docx import Document
+from docx.shared import Pt
 
 app = Flask(__name__)
 CORS(app)
 
+# Geçici dosya yükleme dizini
 UPLOAD_DIR = Path(tempfile.gettempdir()) / "ses_transkript"
 UPLOAD_DIR.mkdir(exist_ok=True)
 
+# İş takibi için bellek içi sözlük ve iş parçacığı kilidi
 jobs = {}
+jobs_lock = threading.Lock()
 
-with open(Path(__file__).parent / "templates" / "index.html", encoding="utf-8") as f:
-    HTML_PAGE = f.read()
+# HTML sayfasını yükle
+# Şablonun doğru klasörden okunmasını garanti altına almak için mutlak yol kullanıyoruz
+TEMPLATE_PATH = Path(__file__).parent / "templates" / "index.html"
+if TEMPLATE_PATH.exists():
+    with open(TEMPLATE_PATH, encoding="utf-8") as f:
+        HTML_PAGE = f.read()
+else:
+    HTML_PAGE = "<h1>Hata: templates/index.html dosyası bulunamadı!</h1>"
 
 
 @app.route("/")
@@ -43,52 +53,79 @@ def transcribe():
         return jsonify({"error": "Dosya seçilmedi"}), 400
 
     job_id = str(uuid.uuid4())
-    jobs[job_id] = {"status": "processing", "progress": "Dosya yükleniyor..."}
+    
+    with jobs_lock:
+        jobs[job_id] = {
+            "status": "processing", 
+            "progress": "Dosya sunucuya yükleniyor ve kaydediliyor..."
+        }
 
+    # Dosya uzantısını koruyarak geçici olarak kaydet
     suffix = Path(file.filename).suffix or ".mp3"
     audio_path = UPLOAD_DIR / f"{job_id}{suffix}"
     file.save(str(audio_path))
 
     filename = file.filename
 
-    def process():
+    def process_audio():
         try:
-            jobs[job_id]["progress"] = "Whisper modeli yükleniyor..."
-            # faster-whisper'ı içe aktar
+            with jobs_lock:
+                jobs[job_id]["progress"] = "Whisper modeli belleğe yükleniyor..."
+            
+            # Bellek ve hız optimizasyonu için faster-whisper kütüphanesi iş parçacığı içinde içe aktarılır
             from faster_whisper import WhisperModel
             
-            # cpu ve int8 (sıkıştırılmış) formatında yükle - RAM tasarrufu için kritik!
+            # İşlemci (CPU) üzerinde int8 sıkıştırma formatıyla çalıştırma (RAM tasarrufu sağlar)
+            print(f"[{job_id}] Model yükleniyor: {model}")
             model_obj = WhisperModel(model, device="cpu", compute_type="int8")
 
-            jobs[job_id]["progress"] = "Transkripsiyon yapılıyor..."
+            with jobs_lock:
+                jobs[job_id]["progress"] = "Ses dosyası çözümleniyor (Transkripsiyon)..."
             
             opts = {}
             if language:
                 opts["language"] = language
 
-            # Transkripsiyonu başlat
+            print(f"[{job_id}] Transkripsiyon başlatıldı. Dil seçimi: {language or 'Otomatik'}")
+            
+            # Transkripsiyon işlemini başlat (segments bir jeneratördür)
             segments, info = model_obj.transcribe(str(audio_path), **opts)
             
-            # Segmentleri birleştirip metne çevir
-            text = " ".join([segment.text for segment in segments]).strip()
+            # Jeneratördeki tüm segmentleri tüketerek metni birleştiriyoruz
+            text_segments = []
+            for segment in segments:
+                text_segments.append(segment.text)
+                
+            text = " ".join(text_segments).strip()
             detected_lang = info.language
+            print(f"[{job_id}] Çeviri tamamlandı. Algılanan Dil: {detected_lang}")
 
-            jobs[job_id].update({
-                "status": "done",
-                "text": text,
-                "language": detected_lang,
-                "filename": filename,
-            })
+            with jobs_lock:
+                jobs[job_id].update({
+                    "status": "done",
+                    "text": text,
+                    "language": detected_lang,
+                    "filename": filename,
+                })
 
         except Exception as e:
-            jobs[job_id] = {"status": "error", "error": str(e)}
+            print(f"[{job_id}] Kritik Hata Oluştu: {str(e)}")
+            with jobs_lock:
+                jobs[job_id] = {
+                    "status": "error", 
+                    "error": f"Dönüştürme sırasında bir hata oluştu: {str(e)}"
+                }
         finally:
+            # İşlem ne olursa olsun geçici ses dosyasını diskten temizle
             try:
-                audio_path.unlink()
-            except Exception:
-                pass
+                if audio_path.exists():
+                    audio_path.unlink()
+                    print(f"[{job_id}] Geçici ses dosyası silindi.")
+            except Exception as clean_error:
+                print(f"[{job_id}] Geçici dosya silme hatası: {str(clean_error)}")
 
-    thread = threading.Thread(target=process)
+    # İşlemi ana thread'i bloke etmemek için arka planda başlatıyoruz
+    thread = threading.Thread(target=process_audio)
     thread.start()
 
     return jsonify({"job_id": job_id})
@@ -96,21 +133,20 @@ def transcribe():
 
 @app.route("/status/<job_id>")
 def status(job_id):
-    job = jobs.get(job_id)
+    with jobs_lock:
+        job = jobs.get(job_id)
     if not job:
-        return jsonify({"error": "İş bulunamadı"}), 404
+        return jsonify({"error": "İşlem bulunamadı veya sunucu belleğinden silindi."}), 404
     return jsonify(job)
 
 
-from docx import Document
-from docx.shared import Pt
-import datetime
-
 @app.route("/download/<job_id>")
 def download(job_id):
-    job = jobs.get(job_id)
+    with jobs_lock:
+        job = jobs.get(job_id)
+        
     if not job or job.get("status") != "done":
-        return jsonify({"error": "Transkript hazır değil"}), 400
+        return jsonify({"error": "Transkript henüz hazır değil veya iş bulunamadı."}), 400
 
     text = job["text"]
     filename = Path(job.get("filename", "transkript")).stem
@@ -118,24 +154,23 @@ def download(job_id):
     
     docx_path = UPLOAD_DIR / f"{job_id}.docx"
 
-    # Node.js yerine doğrudan Python ile Word oluşturma
     try:
         doc = Document()
         
-        # Başlık
+        # Belge Başlığı
         baslik = doc.add_heading(f'Transkript: {filename}', 0)
         baslik.style.font.name = 'Calibri'
         
-        # Bilgi satırı
+        # Bilgi ve Zaman Damgası Satırı
         now = datetime.datetime.now().strftime("%d.%m.%Y %H:%M:%S")
-        bilgi_metni = f"Oluşturulma: {now}"
+        bilgi_metni = f"Oluşturulma Tarihi: {now}"
         if detected_lang:
-            bilgi_metni += f"   •   Algılanan dil: {detected_lang.upper()}"
+            bilgi_metni += f"    •    Algılanan Dil: {detected_lang.upper()}"
         doc.add_paragraph(bilgi_metni)
         
-        doc.add_paragraph("_" * 50) # Ayırıcı çizgi
+        doc.add_paragraph("_" * 50)  # Görsel ayırıcı çizgi
         
-        # Metni paragraflara bölerek ekle
+        # Metni paragraflara bölerek temiz bir şekilde ekle
         paragraphs = [p.strip() for p in text.split("\n") if p.strip()]
         if not paragraphs:
             paragraphs = [text]
@@ -149,7 +184,7 @@ def download(job_id):
         doc.save(str(docx_path))
         
     except Exception as e:
-        return jsonify({"error": f"Word oluşturma hatası: {str(e)}"}), 500
+        return jsonify({"error": f"Word belgesi oluşturulurken hata meydana geldi: {str(e)}"}), 500
 
     return send_file(
         str(docx_path),
@@ -159,87 +194,9 @@ def download(job_id):
     )
 
 
-def build_docx_script(text: str, title: str, lang: str, output_path: str) -> str:
-    paragraphs = [p.strip() for p in text.split("\n") if p.strip()]
-    if not paragraphs:
-        paragraphs = [text]
-
-    safe_title = json.dumps(title)
-    safe_lang = json.dumps(lang)
-    safe_output = json.dumps(output_path)
-
-    para_lines = []
-    for p in paragraphs:
-        safe_p = json.dumps(p)
-        para_lines.append(f"""
-        new Paragraph({{
-          children: [new TextRun({{ text: {safe_p}, size: 24, font: "Calibri" }})],
-          spacing: {{ after: 160 }}
-        }})""")
-
-    paras_js = ",\n".join(para_lines)
-
-    return f"""
-const {{ Document, Packer, Paragraph, TextRun, HeadingLevel }} = require("docx");
-const fs = require("fs");
-
-const title = {safe_title};
-const lang = {safe_lang};
-const outputPath = {safe_output};
-const now = new Date().toLocaleString("tr-TR");
-
-const doc = new Document({{
-  styles: {{
-    default: {{ document: {{ run: {{ font: "Calibri", size: 24 }} }} }},
-    paragraphStyles: [
-      {{
-        id: "Heading1", name: "Heading 1", basedOn: "Normal", next: "Normal", quickFormat: true,
-        run: {{ size: 36, bold: true, font: "Calibri", color: "1A1A2E" }},
-        paragraph: {{ spacing: {{ before: 0, after: 240 }}, outlineLevel: 0 }}
-      }}
-    ]
-  }},
-  sections: [{{
-    properties: {{
-      page: {{
-        size: {{ width: 11906, height: 16838 }},
-        margin: {{ top: 1440, right: 1440, bottom: 1440, left: 1800 }}
-      }}
-    }},
-    children: [
-      new Paragraph({{
-        heading: HeadingLevel.HEADING_1,
-        children: [new TextRun({{ text: "Transkript: " + title, bold: true, font: "Calibri" }})]
-      }}),
-      new Paragraph({{
-        children: [
-          new TextRun({{ text: "Oluşturulma: " + now, size: 18, color: "888888", font: "Calibri" }}),
-          lang ? new TextRun({{ text: "   •   Algılanan dil: " + lang.toUpperCase(), size: 18, color: "888888", font: "Calibri" }}) : new TextRun("")
-        ],
-        spacing: {{ after: 400 }}
-      }}),
-      new Paragraph({{
-        children: [new TextRun({{ text: "" }})],
-        border: {{ bottom: {{ style: "single", size: 6, color: "DDDDDD", space: 1 }} }},
-        spacing: {{ after: 400 }}
-      }}),
-      {paras_js}
-    ]
-  }}]
-}});
-
-Packer.toBuffer(doc).then(buf => {{
-  fs.writeFileSync(outputPath, buf);
-  console.log("OK: " + outputPath);
-}}).catch(e => {{
-  console.error(e);
-  process.exit(1);
-}});
-"""
-
-
 if __name__ == "__main__":
-    import os
-    print("🎙️  Ses → Metin → Word Sunucusu başlatılıyor...")
-    print("🌐  http://localhost:5000 adresini açın")
-    app.run(debug=False, host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
+    print("🎙️ Ses → Metin → Word Sunucusu başlatılıyor...")
+    print("🌐 Tarayıcınızdan http://localhost:5000 adresine gidin.")
+    # Port bilgisini ortam değişkenlerinden al, yoksa varsayılan olarak 5000 kullan
+    port = int(os.environ.get("PORT", 5000))
+    app.run(debug=False, host="0.0.0.0", port=port)
