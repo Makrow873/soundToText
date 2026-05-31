@@ -525,8 +525,17 @@
         const res = await fetch(`/status/${currentJobId}`);
         const data = await res.json();
 
+        // KİLİTLENMEYİ ÖNLEYEN YENİ KONTROL: 
+        // Sunucu hatası durumunda veya iş silindiğinde döngüyü güvenle sonlandırır.
+        if (!res.ok || data.error) {
+          clearInterval(pollInterval);
+          showError(data.error || "Sunucu yanıt vermiyor veya işlem yarıda kesildi.");
+          hideProgress();
+          return;
+        }
+
         if (data.status === "processing") {
-          progress = Math.min(progress + 8, 85);
+          progress = Math.min(progress + 5, 90); // %90'da beklet, backend bitirince %100 olacak
           showProgress(data.progress || "İşleniyor...", progress);
         } else if (data.status === "done") {
           clearInterval(pollInterval);
@@ -539,7 +548,7 @@
         }
       } catch (e) {
         clearInterval(pollInterval);
-        showError("Bağlantı hatası");
+        showError("Sunucuyla bağlantı kesildi veya bağlantı hatası oluştu.");
         hideProgress();
       }
     }, 1500);
